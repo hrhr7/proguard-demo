@@ -1,0 +1,133 @@
+//import proguard.gradle.ProGuardTask
+
+buildscript {
+    repositories {
+        mavenLocal()
+        mavenCentral()
+        google()
+    }
+    dependencies {
+        classpath 'com.guardsquare:proguard-gradle:7.5.0'
+    }
+}
+
+plugins {
+    id 'org.springframework.boot' version '3.3.2'
+    id 'io.spring.dependency-management' version '1.1.6'
+    id 'java'
+}
+
+group = 'demo'
+version = '0.0.1-test'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
+
+// 생성된 JAR 파일 추출 작업 : JAR 파일을 extracted/ 디렉토리로 추출하여 난독화 작업을 위해 준비
+task extractJar(type: Copy) {
+    dependsOn tasks.assemble
+
+    def zipFile = file("${buildDir}/libs/${project.name}-${version}.jar")
+    def outputDir = file("${buildDir}/extracted/")
+
+    from zipTree(zipFile)
+    into outputDir
+}
+
+// 기존 클래스 삭제 작업 : 난독화 된 새 파일들로 대체하기 위해
+task deleteClasses(type: Delete) {
+    delete "${buildDir}/extracted/BOOT-INF/classes/"
+}
+
+// 난독화된 jar 파일 복사 작업 : 해당 작업이 없으면 난독화 파일이 최종 패키지에 포함되지 않음
+// 난독화 클래스 파일이 있는 obfuscatedClasses.jar 에서 deleteClasses 로 인해 비워진 디렉토리에 복사
+task copyObfuscatedClasses(type: Copy) {
+    dependsOn ':proguard' // :proguard 작업이 완료 된 후 copyObfuscatedClasses 작업 실행되도록 종속성 명시적으로 입력
+    dependsOn tasks.deleteClasses
+
+    from zipTree("${buildDir}/obfuscatedClasses.jar")
+    into "${buildDir}/extracted/BOOT-INF/classes/"
+}
+
+// 난독화 과정 후 생성된 임시 obfuscatedClasses.jar 파일 삭제
+task deleteObfuscated(type: Delete) {
+    delete 'build/obfuscatedClasses.jar'
+}
+
+// 난독화 된 클래스 파일을 포함하여 새로운 JAR 파일 생성 작업
+task repackage(type: Zip) {
+    dependsOn tasks.deleteClasses
+    dependsOn tasks.copyObfuscatedClasses
+    dependsOn tasks.deleteObfuscated
+
+    from  "${buildDir}/extracted"
+    entryCompression ZipEntryCompression.STORED // 압축 최소화 하여 성능 최적화
+    archiveFileName= "${project.name}-${archiveVersion.get()}-obfuscated.jar" // 버전관리
+    destinationDirectory = file("${buildDir}/libs")
+}
+
+// 난독화 수행 작업 : 입력 JAR 에서 난독화를 수행하고 obfuscatedClasses.jar 로 출력
+task proguard(type: proguard.gradle.ProGuardTask) {
+    dependsOn tasks.extractJar
+    configuration 'src/main/resources/proguard.conf'
+
+    verbose
+
+    injars  "${buildDir}/extracted/BOOT-INF/classes"
+    outjars "${buildDir}/obfuscatedClasses.jar"
+
+    // 해당 프로젝트에 사용하는 라이브러리 난독화 설정
+    // Java 버전에 따른 적적한 라이브러리를 자동 빌드
+    if (System.getProperty('java.version').startsWith('1.')) {
+        // Java 9 이전은 jar 파일
+        libraryjars "${System.getProperty('java.home')}/lib/rt.jar"
+    } else {
+        // Java 9 이후는 jmod 파일 (현재 Java 17 사용)
+        libraryjars "${System.getProperty('java.home')}/jmods/java.base.jmod", jarfilter: '!**.jar', filter: '!module-info.class'
+        //libraryjars "${System.getProperty('java.home')}/jmods/....."
+    }
+
+    // Spring 의존성 포함 : classpath에 있는 모든 라이브러리를 난독화 프로세스의 참조 라이브러리로 포함
+    libraryjars sourceSets.main.compileClasspath
+
+    // 디렉토리 구조 유지 (패키지 구조 변경 안되게)
+    keepdirectories
+
+    // 난독화 제외 설정
+    // 주요 클래스 유지 : 애플리케이션 메인클래스와 메인메소드를 난독화에서 제외시켜야 실행 가능
+    keep 'public class com.example.demo.DemoApplication { \
+            public static void main(java.lang.String[]); \
+         }'
+
+    // 어노테이션 유지
+    keepattributes '*Annotation*'
+
+    // @Component 어노테이션 붙은 모든 클래스 난독화 제외
+    keep 'public @org.springframework.stereotype.Component class *'
+
+    // @Autowired, @Value 사용된 클래스 난독화 제외 : 의존성 주입과 설정 값을 처리하기 위해
+    keepclassmembers 'public class * { \
+            @org.springframework.beans.factory.annotation.Autowired *; \
+            @org.springframework.beans.factory.annotation.Value *; \
+        }'
+
+    // 난독화 완료 후, 난독화 된 클래스들을 포함하는 새로운 JAR 파일 생성
+    finalizedBy tasks.repackage
+}
